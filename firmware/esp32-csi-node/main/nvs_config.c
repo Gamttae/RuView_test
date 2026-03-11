@@ -91,6 +91,10 @@ void nvs_config_load(nvs_config_t *cfg)
     cfg->wasm_verify = 0;  /* Kconfig disabled signature verification. */
 #endif
 
+    /* Home WiFi defaults: DHCP enabled, no mDNS hostname override. */
+    cfg->dhcp_enabled = 1;
+    cfg->mdns_hostname[0] = '\0';
+
     /* Try to override from NVS */
     nvs_handle_t handle;
     esp_err_t err = nvs_open("csi_cfg", NVS_READONLY, &handle);
@@ -245,6 +249,20 @@ void nvs_config_load(nvs_config_t *cfg)
             cfg->power_duty = duty_val;
             ESP_LOGI(TAG, "NVS override: power_duty=%u%%", (unsigned)cfg->power_duty);
         }
+    }
+
+    /* Home WiFi: DHCP mode (default enabled) and mDNS hostname. */
+    uint8_t dhcp_val;
+    if (nvs_get_u8(handle, "dhcp_en", &dhcp_val) == ESP_OK) {
+        cfg->dhcp_enabled = dhcp_val ? 1 : 0;
+        ESP_LOGI(TAG, "NVS override: dhcp_enabled=%u", (unsigned)cfg->dhcp_enabled);
+    }
+
+    len = NVS_CFG_HOSTNAME_MAX;
+    if (nvs_get_str(handle, "mdns_host", buf, &len) == ESP_OK && len > 1) {
+        strncpy(cfg->mdns_hostname, buf, NVS_CFG_HOSTNAME_MAX - 1);
+        cfg->mdns_hostname[NVS_CFG_HOSTNAME_MAX - 1] = '\0';
+        ESP_LOGI(TAG, "NVS override: mdns_hostname=%s", cfg->mdns_hostname);
     }
 
     /* ADR-040: WASM configuration overrides. */

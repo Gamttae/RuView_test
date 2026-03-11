@@ -8,6 +8,12 @@ so users can configure a pre-built firmware binary without recompiling.
 Usage:
     python provision.py --port COM7 --ssid "MyWiFi" --password "secret" --target-ip 192.168.1.20
 
+    # Home WiFi: let the script discover the aggregator IP automatically
+    python provision.py --port COM7 --ssid "HomeNetwork" --password "secret" --auto-discover
+
+    # List available WiFi networks near the provisioning machine
+    python provision.py --port COM7 --scan-networks
+
 Requirements:
     pip install esptool nvs-partition-gen
     (or use the nvs_partition_gen.py bundled with ESP-IDF)
@@ -17,6 +23,7 @@ import argparse
 import csv
 import io
 import os
+import socket
 import struct
 import subprocess
 import sys
@@ -28,6 +35,133 @@ import tempfile
 # 0x6000 (24576) bytes.
 NVS_PARTITION_OFFSET = 0x9000
 NVS_PARTITION_SIZE = 0x6000  # 24 KiB
+
+# UDP port the aggregator listens on for CSI frames (and discovery beacons).
+AGGREGATOR_DEFAULT_PORT = 5005
+# Discovery request sent as a UDP broadcast; aggregator replies with its IP.
+DISCOVERY_REQUEST = b"RUVIEW_DISCOVER"
+DISCOVERY_TIMEOUT = 2.0  # seconds
+
+
+def get_local_ip():
+    """Return the machine's primary outbound IP address."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def scan_wifi_networks():
+    """
+    Return a list of visible WiFi networks as strings.
+
+    Uses platform-specific commands (iwlist on Linux, netsh on Windows,
+    airport on macOS).  Returns an empty list if scanning is unavailable.
+    """
+    networks = []
+    try:
+        if sys.platform.startswith("linux"):
+            # Detect the active wireless interface from /proc/net/wireless
+            iface = None
+            try:
+                with open("/proc/net/wireless") as f:
+                    for line in f:
+                        line = line.strip()
+                        if ":" in line and not line.startswith("|"):
+                            iface = line.split(":")[0].strip()
+                            break
+            except OSError:
+                pass
+            iface_arg = iface if iface else "wlan0"
+            try:
+                out = subprocess.check_output(
+                    ["iwlist", iface_arg, "scanning"],
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                ).decode(errors="replace")
+                for line in out.splitlines():
+                    line = line.strip()
+                    if line.startswith("ESSID:"):
+                        ssid = line.split(":", 1)[1].strip('"')
+                        if ssid:
+                            networks.append(ssid)
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                pass
+        elif sys.platform == "win32":
+            out = subprocess.check_output(
+                ["netsh", "wlan", "show", "networks"],
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            ).decode(errors="replace")
+            for line in out.splitlines():
+                line = line.strip()
+                if line.startswith("SSID") and ":" in line:
+                    parts = line.split(":", 1)
+                    # Skip lines like "SSID Name" header
+                    if parts[0].strip().upper() == "SSID":
+                        ssid = parts[1].strip()
+                        if ssid:
+                            networks.append(ssid)
+        elif sys.platform == "darwin":
+            airport = (
+                "/System/Library/PrivateFrameworks/Apple80211.framework"
+                "/Versions/Current/Resources/airport"
+            )
+            if os.path.isfile(airport):
+                out = subprocess.check_output(
+                    [airport, "-s"],
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                ).decode(errors="replace")
+                for line in out.splitlines()[1:]:  # skip header
+                    parts = line.split()
+                    if parts:
+                        networks.append(parts[0])
+    except Exception:
+        pass
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for n in networks:
+        if n not in seen:
+            seen.add(n)
+            unique.append(n)
+    return unique
+
+
+def discover_aggregator(port=AGGREGATOR_DEFAULT_PORT, timeout=DISCOVERY_TIMEOUT):
+    """
+    Broadcast a discovery packet on the local network and wait for the
+    aggregator to reply.  Returns the aggregator's IP string, or None.
+
+    The aggregator (sensing-server) replies to RUVIEW_DISCOVER with its own
+    IP:port so the provisioning script can obtain the target IP without the
+    user having to look it up manually.
+    """
+    try:
+        local_ip = get_local_ip()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.settimeout(timeout)
+        sock.bind((local_ip, 0))
+        sock.sendto(DISCOVERY_REQUEST, ("<broadcast>", port))
+        try:
+            data, (host, _) = sock.recvfrom(256)
+            # Aggregator may reply with "RUVIEW_HERE:<ip>" or just an IP string.
+            reply = data.decode(errors="replace").strip()
+            if reply.startswith("RUVIEW_HERE:"):
+                host = reply.split(":", 1)[1].strip()
+            return host
+        except socket.timeout:
+            return None
+        finally:
+            sock.close()
+    except Exception:
+        return None
 
 
 def build_nvs_csv(args):
@@ -64,6 +198,11 @@ def build_nvs_csv(args):
         writer.writerow(["vital_int", "data", "u16", str(args.vital_int)])
     if args.subk_count is not None:
         writer.writerow(["subk_count", "data", "u8", str(args.subk_count)])
+    # Home WiFi settings
+    if args.enable_dhcp:
+        writer.writerow(["dhcp_en", "data", "u8", "1"])
+    if args.mdns_hostname:
+        writer.writerow(["mdns_host", "data", "string", args.mdns_hostname])
     return buf.getvalue()
 
 
@@ -145,7 +284,15 @@ def flash_nvs(port, baud, nvs_bin):
 def main():
     parser = argparse.ArgumentParser(
         description="Provision ESP32-S3 CSI Node with WiFi and aggregator settings",
-        epilog="Example: python provision.py --port COM7 --ssid MyWiFi --password secret --target-ip 192.168.1.20",
+        epilog=(
+            "Examples:\n"
+            "  python provision.py --port COM7 --ssid MyWiFi --password secret "
+            "--target-ip 192.168.1.20\n"
+            "  python provision.py --port COM7 --ssid HomeNetwork --password secret "
+            "--auto-discover\n"
+            "  python provision.py --port COM7 --scan-networks"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--port", required=True, help="Serial port (e.g. COM7, /dev/ttyUSB0)")
     parser.add_argument("--baud", type=int, default=460800, help="Flash baud rate (default: 460800)")
@@ -165,9 +312,63 @@ def main():
     parser.add_argument("--vital-win", type=int, help="Phase history window in frames (default: 300)")
     parser.add_argument("--vital-int", type=int, help="Vitals packet interval in ms (default: 1000)")
     parser.add_argument("--subk-count", type=int, help="Top-K subcarrier count (default: 32)")
+    # Home WiFi settings
+    parser.add_argument(
+        "--enable-dhcp", action="store_true",
+        help="Enable DHCP on the ESP32 STA interface (default for home networks)",
+    )
+    parser.add_argument(
+        "--mdns-hostname",
+        help='mDNS hostname for this node (e.g. "ruview-1" → reachable as ruview-1.local)',
+    )
+    parser.add_argument(
+        "--auto-discover", action="store_true",
+        help=(
+            "Broadcast a discovery packet on the local network to find the aggregator "
+            "IP automatically. Useful on home networks where the aggregator IP changes. "
+            "Falls back to --target-ip if discovery fails."
+        ),
+    )
+    parser.add_argument(
+        "--scan-networks", action="store_true",
+        help="List visible WiFi networks and exit (helps finding the correct --ssid).",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Generate NVS binary but don't flash")
 
     args = parser.parse_args()
+
+    # --scan-networks: list nearby SSIDs and exit without flashing anything.
+    if args.scan_networks:
+        print("Scanning for visible WiFi networks...")
+        networks = scan_wifi_networks()
+        if networks:
+            print(f"Found {len(networks)} network(s):")
+            for n in networks:
+                print(f"  • {n}")
+        else:
+            print(
+                "No networks found (may require root/admin privileges or a WiFi-capable interface)."
+            )
+        return
+
+    # --auto-discover: try to locate the aggregator on the LAN.
+    if args.auto_discover and not args.target_ip:
+        port = args.target_port or AGGREGATOR_DEFAULT_PORT
+        print(f"Searching for aggregator on UDP broadcast port {port}...")
+        discovered = discover_aggregator(port=port)
+        if discovered:
+            print(f"Aggregator found at {discovered}")
+            args.target_ip = discovered
+        else:
+            local_ip = get_local_ip()
+            print(
+                f"Auto-discovery found no aggregator. "
+                f"This machine's IP is {local_ip}. "
+                f"Make sure the sensing server is running (--source esp32) and reachable on port {port}."
+            )
+            # Offer the machine's own IP as a fallback default.
+            args.target_ip = local_ip
+            print(f"Using local IP {local_ip} as fallback aggregator address.")
 
     has_value = any([
         args.ssid, args.password is not None, args.target_ip,
@@ -176,6 +377,7 @@ def main():
         args.edge_tier is not None, args.pres_thresh is not None,
         args.fall_thresh is not None, args.vital_win is not None,
         args.vital_int is not None, args.subk_count is not None,
+        args.enable_dhcp, args.mdns_hostname is not None,
     ])
     if not has_value:
         parser.error("At least one config value must be specified")
@@ -212,6 +414,10 @@ def main():
         print(f"  Vital Interval:{args.vital_int} ms")
     if args.subk_count is not None:
         print(f"  Top-K Subcarr: {args.subk_count}")
+    if args.enable_dhcp:
+        print("  DHCP:          enabled")
+    if args.mdns_hostname:
+        print(f"  mDNS hostname: {args.mdns_hostname}.local")
 
     csv_content = build_nvs_csv(args)
 

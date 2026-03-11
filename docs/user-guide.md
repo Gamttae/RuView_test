@@ -37,9 +37,15 @@ WiFi DensePose turns commodity WiFi signals into real-time human pose estimation
 14. [Hardware Setup](#hardware-setup)
     - [ESP32-S3 Mesh](#esp32-s3-mesh)
     - [Intel 5300 / Atheros NIC](#intel-5300--atheros-nic)
-15. [Docker Compose (Multi-Service)](#docker-compose-multi-service)
-16. [Troubleshooting](#troubleshooting)
-17. [FAQ](#faq)
+15. [Home WiFi Setup](#home-wifi-setup)
+    - [Step 1 — Find Your Aggregator IP](#step-1--find-your-aggregator-ip)
+    - [Step 2 — Start the Aggregator](#step-2--start-the-aggregator)
+    - [Step 3 — Provision the ESP32 Nodes](#step-3--provision-the-esp32-nodes)
+    - [Auto-Discovery (One-Command Setup)](#auto-discovery-one-command-setup)
+    - [Scan Visible Networks](#scan-visible-networks)
+16. [Docker Compose (Multi-Service)](#docker-compose-multi-service)
+17. [Troubleshooting](#troubleshooting)
+18. [FAQ](#faq)
 
 ---
 
@@ -917,7 +923,171 @@ These are advanced setups. See the respective driver documentation for installat
 
 ---
 
-## Docker Compose (Multi-Service)
+## Home WiFi Setup
+
+This section walks through connecting RuView to your **existing home router** in four steps. No dedicated network or static IP assignment is required.
+
+### What the system needs
+
+| Component | Role | Where it runs |
+|-----------|------|---------------|
+| 1-6× ESP32-S3 boards | CSI capture — plugged into USB to provision, then placed around the room | Near your router |
+| Sensing server (aggregator) | Receives CSI frames over UDP, runs the ML pipeline | Your laptop / desktop |
+| Home router | WiFi access point — the nodes connect to it exactly like any other device | Already in your home |
+
+The ESP32 boards connect to your home WiFi using WPA2/WPA3 exactly like a phone or laptop (DHCP is used automatically — no static IP configuration needed on the nodes). The only manual step is telling each node the IP address of the computer running the sensing server.
+
+---
+
+### Step 1 — Find Your Aggregator IP
+
+The **aggregator** is the computer running `sensing-server`. On a home network it gets an IP from your router via DHCP (e.g. `192.168.1.42`). Find it with:
+
+**Windows:**
+```
+ipconfig
+```
+Look for the `IPv4 Address` under your WiFi adapter.
+
+**macOS / Linux:**
+```bash
+ip route get 1 | awk '{print $7; exit}'   # Linux
+ipconfig getifaddr en0                     # macOS (en0 = WiFi)
+```
+
+Write down this IP — you will supply it as `--target-ip` when provisioning the ESP32 nodes.
+
+> **Tip:** If your aggregator IP changes each time you connect (common on home networks), use [Auto-Discovery](#auto-discovery-one-command-setup) instead.
+
+---
+
+### Step 2 — Start the Aggregator
+
+Start the sensing server **before** powering on the ESP32 nodes so it is ready to receive UDP frames on port 5005.
+
+**Docker (easiest):**
+```bash
+docker run -p 3000:3000 -p 3001:3001 -p 5005:5005/udp \
+  -e CSI_SOURCE=esp32 \
+  ruvnet/wifi-densepose:latest
+```
+
+**From source:**
+```bash
+./target/release/sensing-server \
+  --source esp32 --udp-port 5005 --http-port 3000 --ws-port 3001
+```
+
+Open `http://localhost:3000` to confirm the UI loads.
+
+---
+
+### Step 3 — Provision the ESP32 Nodes
+
+Connect each ESP32-S3 to your computer via USB and run:
+
+```bash
+# First node (replace COM7 / /dev/ttyUSB0 with your serial port)
+python firmware/esp32-csi-node/provision.py \
+  --port /dev/ttyUSB0 \
+  --ssid  "YourHomeWiFiName" \
+  --password "YourWiFiPassword" \
+  --target-ip 192.168.1.42   # <-- the IP from Step 1
+```
+
+For a 3-node setup, repeat for each board (no other flags needed for a basic single-room deployment):
+
+```bash
+python firmware/esp32-csi-node/provision.py --port /dev/ttyUSB1 \
+  --ssid "YourHomeWiFiName" --password "YourWiFiPassword" \
+  --target-ip 192.168.1.42
+
+python firmware/esp32-csi-node/provision.py --port /dev/ttyUSB2 \
+  --ssid "YourHomeWiFiName" --password "YourWiFiPassword" \
+  --target-ip 192.168.1.42
+```
+
+Disconnect the USB cables and place the nodes around the room. Within a few seconds the sensing server will start receiving CSI frames and the UI will show live data.
+
+---
+
+### Auto-Discovery (One-Command Setup)
+
+If you do not want to look up the aggregator IP manually, use `--auto-discover`. The provisioning script broadcasts a discovery packet on your LAN; the sensing server replies with its IP automatically.
+
+```bash
+python firmware/esp32-csi-node/provision.py \
+  --port /dev/ttyUSB0 \
+  --ssid "YourHomeWiFiName" \
+  --password "YourWiFiPassword" \
+  --auto-discover
+```
+
+Example output:
+```
+Searching for aggregator on UDP broadcast port 5005...
+Aggregator found at 192.168.1.42
+Building NVS configuration:
+  WiFi SSID:     YourHomeWiFiName
+  WiFi Password: ****
+  Target IP:     192.168.1.42
+Flashing NVS partition (24576 bytes) to /dev/ttyUSB0...
+NVS provisioning complete!
+```
+
+> **Note:** Auto-discovery requires the sensing server to be running and reachable on the same subnet as your provisioning machine. Docker users must expose UDP port 5005 (the `-p 5005:5005/udp` flag).
+
+---
+
+### Scan Visible Networks
+
+Not sure of your home network's exact SSID? List all visible networks from your machine:
+
+```bash
+python firmware/esp32-csi-node/provision.py --port /dev/ttyUSB0 --scan-networks
+```
+
+Example output:
+```
+Scanning for visible WiFi networks...
+Found 4 network(s):
+  • MyHomeNetwork
+  • Neighbors_WiFi
+  • DIRECT-xy-HP-Printer
+  • GuestNet
+```
+
+Then use the correct SSID name with `--ssid`.
+
+---
+
+### Optional: per-node mDNS hostname
+
+Give each node a memorable `.local` name so you can identify it in logs without memorising MAC addresses:
+
+```bash
+python firmware/esp32-csi-node/provision.py \
+  --port /dev/ttyUSB0 \
+  --ssid "MyHomeNetwork" --password "secret" \
+  --target-ip 192.168.1.42 \
+  --mdns-hostname ruview-1
+```
+
+The node will register as `ruview-1.local` on your network.
+
+---
+
+### Home WiFi Checklist
+
+| Check | What to do |
+|-------|-----------|
+| ✅ Router SSID and password on hand | — |
+| ✅ Sensing server running before ESP32 nodes power on | `docker run … -e CSI_SOURCE=esp32` |
+| ✅ UDP port 5005 reachable from the LAN | Firewall / Docker `-p 5005:5005/udp` |
+| ✅ Correct serial port for each ESP32 | Device Manager (Windows) / `ls /dev/ttyUSB*` (Linux) |
+| ✅ esptool installed | `pip install esptool` |
+
+---
 
 For production deployments with both Rust and Python services:
 
@@ -1012,6 +1182,12 @@ The server applies a 3-stage smoothing pipeline (ADR-048). If readings are still
 
 **Q: Do I need special hardware to try this?**
 No. Run `docker run -p 3000:3000 ruvnet/wifi-densepose:latest` and open `http://localhost:3000`. Simulated mode exercises the full pipeline with synthetic data.
+
+**Q: Can I use this on my home WiFi network?**
+Yes. The ESP32 nodes connect to your home router using WPA2/WPA3 just like any other device — DHCP is used automatically. The only step is provisioning each node with your WiFi password and the local IP of the computer running the sensing server. See [Home WiFi Setup](#home-wifi-setup) for the full walkthrough, including the `--auto-discover` flag that finds the aggregator IP for you.
+
+**Q: Do I need to open any ports on my router for home use?**
+No inbound ports need to be opened on your router. The ESP32 nodes connect *to* the sensing server on your local network (LAN), not from the internet. If you are running the sensing server inside Docker, pass `-p 5005:5005/udp` so the container can receive UDP frames from the nodes.
 
 **Q: Can consumer WiFi laptops do pose estimation?**
 No. Consumer WiFi exposes only RSSI (one number per access point), not CSI (56+ complex subcarrier values per frame). RSSI supports coarse presence and motion detection. Full pose estimation requires CSI-capable hardware like an ESP32-S3 ($8) or a research NIC.
