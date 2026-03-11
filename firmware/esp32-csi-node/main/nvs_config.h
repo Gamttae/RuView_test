@@ -14,9 +14,10 @@
 #include <stdint.h>
 
 /** Maximum lengths for NVS string fields. */
-#define NVS_CFG_SSID_MAX     33
-#define NVS_CFG_PASS_MAX     65
-#define NVS_CFG_IP_MAX       16
+#define NVS_CFG_SSID_MAX      33
+#define NVS_CFG_PASS_MAX      65
+#define NVS_CFG_IP_MAX        16
+#define NVS_CFG_HOSTNAME_MAX  33  /**< mDNS hostname for this node (e.g. "ruview-1" → "ruview-1.local"). */
 
 /** Maximum channels in the hop list (must match CSI_HOP_CHANNELS_MAX). */
 #define NVS_CFG_HOP_MAX      6
@@ -50,6 +51,10 @@ typedef struct {
     uint8_t  wasm_verify;                    /**< Require Ed25519 signature for uploads. */
     uint8_t  wasm_pubkey[32];               /**< Ed25519 public key for WASM signature. */
     uint8_t  wasm_pubkey_valid;             /**< 1 if pubkey was loaded from NVS. */
+
+    /* Home WiFi support */
+    uint8_t  dhcp_enabled;                  /**< 1 = use DHCP for ESP32 STA (default); 0 = static. */
+    char     mdns_hostname[NVS_CFG_HOSTNAME_MAX]; /**< mDNS hostname (e.g. "ruview-1"). */
 } nvs_config_t;
 
 /**
