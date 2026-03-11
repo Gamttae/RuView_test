@@ -41,13 +41,16 @@ AGGREGATOR_DEFAULT_PORT = 5005
 # Discovery request sent as a UDP broadcast; aggregator replies with its IP.
 DISCOVERY_REQUEST = b"RUVIEW_DISCOVER"
 DISCOVERY_TIMEOUT = 2.0  # seconds
+# Probe target used to determine the machine's outbound interface IP.
+# No traffic is actually sent; only the routing table is consulted.
+_ROUTE_PROBE_HOST = "8.8.8.8"
 
 
 def get_local_ip():
     """Return the machine's primary outbound IP address."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
+        s.connect((_ROUTE_PROBE_HOST, 80))
         ip = s.getsockname()[0]
         s.close()
         return ip
@@ -154,8 +157,10 @@ def discover_aggregator(port=AGGREGATOR_DEFAULT_PORT, timeout=DISCOVERY_TIMEOUT)
             # Aggregator may reply with "RUVIEW_HERE:<ip>" or just an IP string.
             reply = data.decode(errors="replace").strip()
             if reply.startswith("RUVIEW_HERE:"):
-                host = reply.split(":", 1)[1].strip()
-            return host
+                candidate = reply.split(":", 1)[1].strip()
+                if candidate:
+                    host = candidate
+            return host if host else None
         except socket.timeout:
             return None
         finally:
@@ -362,13 +367,15 @@ def main():
         else:
             local_ip = get_local_ip()
             print(
-                f"Auto-discovery found no aggregator. "
-                f"This machine's IP is {local_ip}. "
-                f"Make sure the sensing server is running (--source esp32) and reachable on port {port}."
+                f"⚠️  Auto-discovery found no aggregator on port {port}.\n"
+                f"   Make sure the sensing server is running (--source esp32) "
+                f"on the same network and listening on UDP port {port}.\n"
+                f"   This machine's IP is {local_ip}.\n"
+                f"   Falling back to this machine's IP as the aggregator address.\n"
+                f"   If the sensing server is on a different host, re-run with "
+                f"--target-ip <host-ip> instead."
             )
-            # Offer the machine's own IP as a fallback default.
             args.target_ip = local_ip
-            print(f"Using local IP {local_ip} as fallback aggregator address.")
 
     has_value = any([
         args.ssid, args.password is not None, args.target_ip,

@@ -1,5 +1,7 @@
 # WiFi DensePose User Guide
 
+> 🇰🇷 **한국어 가이드:** [공유기 연결 방법 (한국어)](user-guide-ko.md)
+
 WiFi DensePose turns commodity WiFi signals into real-time human pose estimation, vital sign monitoring, and presence detection. This guide walks you through installation, first run, API usage, hardware setup, and model training.
 
 ---
